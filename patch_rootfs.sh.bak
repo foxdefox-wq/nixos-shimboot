@@ -18,8 +18,6 @@ copy_modules() {
   local reco_rootfs=$(realpath -m $2)
   local target_rootfs=$(realpath -m $3)
 
-  #NixOS rootfs has no /lib by default; create it before copying.
-  mkdir -p "${target_rootfs}/lib"
   rm -rf "${target_rootfs}/lib/modules"
   cp -r "${shim_rootfs}/lib/modules" "${target_rootfs}/lib/modules"
 
