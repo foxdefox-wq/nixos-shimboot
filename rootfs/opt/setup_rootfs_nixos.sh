@@ -1,7 +1,12 @@
 #!/bin/bash
 
-#setup the NixOS rootfs
-#this is meant to be run within a minimal environment after nix is bootstrapped
+# Write the NixOS configuration into a target rootfs directory.
+# Unlike the Debian/Alpine scripts, this does NOT run inside a chroot --
+# it just lays down /etc/nixos/{configuration,hardware-configuration}.nix
+# and an expand_rootfs helper. The actual system closure is built and
+# copied in by build_rootfs.sh using nix-build + nix copy on the host
+# (see the 'nixos' branch there). nixos-install is intentionally NOT
+# invoked, because it only exists on NixOS hosts.
 
 set -e
 if [ "$DEBUG" ]; then
@@ -17,7 +22,7 @@ enable_root="$6"
 packages="$7"
 arch="$8"
 
-#default packages if none specified
+#default desktop if none specified
 if [ -z "$packages" ]; then
   packages="xfce"
 fi
@@ -31,38 +36,36 @@ desktop_module() {
     lxde)         echo "services.xserver.desktopManager.lxsession.enable = true;" ;;
     cinnamon)     echo "services.xserver.desktopManager.cinnamon.enable = true;" ;;
     mate)         echo "services.xserver.desktopManager.mate.enable = true;" ;;
-    none)         echo "" ;;
+    none|"")      echo "" ;;
     *)            echo "services.xserver.desktopManager.xfce.enable = true;" ;;
   esac
 }
 
 extra_desktop="$(desktop_module "$packages")"
 
-#generate the NixOS configuration
 mkdir -p "$rootfs_dir/etc/nixos"
 cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
 { config, pkgs, lib, ... }:
 {
   imports = [ ./hardware-configuration.nix ];
 
-  # Shimboot: no bootloader, ChromeOS kernel handles boot
+  # Shimboot: no bootloader, ChromeOS kernel handles boot.
   boot.loader.grub.enable = false;
   boot.loader.systemd-boot.enable = false;
-  boot.loader.initScript.enable = true;
 
-  # Shimboot: load ChromeOS kernel modules for WiFi etc.
+  # Shimboot: ChromeOS kernel handles modules; don't try to build an initrd.
   boot.initrd.availableKernelModules = lib.mkForce [];
   boot.initrd.kernelModules = lib.mkForce [];
   boot.kernelModules = [ "iwlmvm" "ccm" "8021q" "tun" "zram" "lzo" ];
   boot.kernelParams = lib.mkForce [];
 
-  # Filesystem: /dev/disk/by-label/nixos written by build script
+  # Rootfs is whatever shimboot labels 'nixos' at build time.
   fileSystems."/" = {
     device = "/dev/disk/by-label/nixos";
     fsType = "ext4";
   };
 
-  # Swap via zram
+  # zram swap (real swap is disabled by the shim kernel anyway).
   zramSwap.enable = true;
   zramSwap.algorithm = "lzo";
 
@@ -77,7 +80,7 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
   services.xserver.displayManager.lightdm.enable = true;
   $extra_desktop
 
-  # Kill frecon before X starts (same as other shimboot distros)
+  # Kill frecon before X starts (matches the Debian/Alpine shimboot path).
   systemd.services.kill-frecon = {
     description = "Kill frecon to allow Xorg to start";
     wantedBy = [ "graphical.target" ];
@@ -89,7 +92,6 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
     };
   };
 
-  # Patched systemd from shimboot repo
   nixpkgs.config.allowUnfree = true;
 
   users.mutableUsers = false;
@@ -106,7 +108,7 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
 
   security.sudo.wheelNeedsPassword = false;
 
-  # Shimboot greeter
+  # Shimboot greeter on login (best-effort -- file may not exist).
   environment.loginShellInit = ''
     if [ -f /run/current-system/sw/bin/shimboot_greeter ]; then
       /run/current-system/sw/bin/shimboot_greeter
@@ -117,10 +119,12 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
     wget curl git nano vim
     pciutils usbutils
     networkmanagerapplet
+    cloud-utils  # provides growpart for expand_rootfs
+    e2fsprogs
+    cryptsetup
+    util-linux
+    (pkgs.writeShellScriptBin "expand_rootfs" (builtins.readFile /etc/nixos/expand_rootfs.sh))
   ];
-
-  # Expand rootfs helper
-  environment.systemPackages = lib.mkAfter [ (pkgs.writeShellScriptBin "expand_rootfs" (builtins.readFile /etc/nixos/expand_rootfs.sh)) ];
 
   services.openssh.enable = true;
   services.openssh.settings.PasswordAuthentication = true;
@@ -129,7 +133,7 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
 }
 NIXCFG
 
-#minimal hardware-configuration stub (real one generated at first boot)
+#minimal hardware-configuration; first boot can regenerate via nixos-generate-config.
 cat > "$rootfs_dir/etc/nixos/hardware-configuration.nix" << 'HWCFG'
 { config, pkgs, lib, modulesPath, ... }:
 {
@@ -138,7 +142,6 @@ cat > "$rootfs_dir/etc/nixos/hardware-configuration.nix" << 'HWCFG'
 }
 HWCFG
 
-#expand_rootfs script (same logic as Debian version, adapted for NixOS)
 cat > "$rootfs_dir/etc/nixos/expand_rootfs.sh" << 'EXPAND'
 #!/bin/bash
 set -e
@@ -169,4 +172,4 @@ EXPAND
 chmod +x "$rootfs_dir/etc/nixos/expand_rootfs.sh"
 
 echo "NixOS configuration written to $rootfs_dir/etc/nixos/"
-echo "NOTE: Run 'nixos-install' or 'nixos-rebuild' on first boot to activate."
+echo "build_rootfs.sh will now build the system closure via nix-build and copy it in."
