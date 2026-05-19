@@ -1,15 +1,13 @@
 #!/bin/bash
 
 # Write the NixOS configuration into a target rootfs directory.
-# Unlike the Debian/Alpine scripts, this does NOT run inside a chroot --
-# it just lays down /etc/nixos/{configuration,hardware-configuration}.nix
-# and an expand_rootfs helper. The actual system closure is built and
-# copied in by build_rootfs.sh using nix-build + nix copy on the host.
+# This does NOT chroot or run nix; it just lays down /etc/nixos/. The
+# actual closure build + copy is done by build_rootfs.sh on the host
+# (via nix-build + nix copy). The goal is to stay as close as possible
+# to ading2210's original Debian/Alpine flow.
 
 set -e
-if [ "$DEBUG" ]; then
-  set -x
-fi
+[ "$DEBUG" ] && set -x
 
 rootfs_dir="$1"
 hostname="$2"
@@ -20,20 +18,18 @@ enable_root="$6"
 packages="$7"
 arch="$8"
 
-if [ -z "$packages" ]; then
-  packages="xfce"
-fi
+[ -z "$packages" ] && packages="xfce"
 
 desktop_module() {
   case "$1" in
-    xfce)         echo "services.xserver.desktopManager.xfce.enable = true;" ;;
-    gnome)        echo "services.xserver.desktopManager.gnome.enable = true;" ;;
-    kde)          echo "services.xserver.displayManager.sddm.enable = true; services.xserver.desktopManager.plasma5.enable = true;" ;;
-    lxde)         echo "services.xserver.desktopManager.lxsession.enable = true;" ;;
-    cinnamon)     echo "services.xserver.desktopManager.cinnamon.enable = true;" ;;
-    mate)         echo "services.xserver.desktopManager.mate.enable = true;" ;;
-    none|"")      echo "" ;;
-    *)            echo "services.xserver.desktopManager.xfce.enable = true;" ;;
+    xfce)     echo "services.xserver.desktopManager.xfce.enable = true;" ;;
+    gnome)    echo "services.xserver.desktopManager.gnome.enable = true;" ;;
+    kde)      echo "services.xserver.displayManager.sddm.enable = true; services.xserver.desktopManager.plasma5.enable = true;" ;;
+    lxde)     echo "services.xserver.desktopManager.lxde.enable = true;" ;;
+    cinnamon) echo "services.xserver.desktopManager.cinnamon.enable = true;" ;;
+    mate)     echo "services.xserver.desktopManager.mate.enable = true;" ;;
+    none|"")  echo "" ;;
+    *)        echo "services.xserver.desktopManager.xfce.enable = true;" ;;
   esac
 }
 
@@ -41,82 +37,87 @@ extra_desktop="$(desktop_module "$packages")"
 
 mkdir -p "$rootfs_dir/etc/nixos"
 cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
+# Minimal NixOS configuration for shimboot.
 { config, pkgs, lib, ... }:
 {
   imports = [ ./hardware-configuration.nix ];
 
+  # SHIMBOOT BOOT SETUP
   boot.loader.grub.enable = false;
   boot.loader.systemd-boot.enable = false;
+  boot.loader.initScript.enable = true;
 
   boot.initrd.availableKernelModules = lib.mkForce [];
   boot.initrd.kernelModules = lib.mkForce [];
-  boot.kernelModules = [ "iwlmvm" "ccm" "8021q" "tun" "zram" "lzo" ];
   boot.kernelParams = lib.mkForce [];
+  boot.kernelModules = [ "iwlmvm" "ccm" "8021q" "tun" "zram" "lzo" ];
+  boot.kernelPackages = pkgs.linuxKernel.packages.linux_6_1;
 
+  # ROOT FILESYSTEM
   fileSystems."/" = {
     device = "/dev/disk/by-label/nixos";
     fsType = "ext4";
+    options = [ "noatime" "commit=30" "errors=remount-ro" ];
   };
 
   zramSwap.enable = true;
   zramSwap.algorithm = "lzo";
 
+  # SYSTEM BASICS
   networking.hostName = "$hostname";
   networking.networkmanager.enable = true;
+  networking.wireless.enable = false;
 
   time.timeZone = "UTC";
   i18n.defaultLocale = "en_US.UTF-8";
+  console.keyMap = "us";
 
+  # DISPLAY
   services.xserver.enable = true;
   services.xserver.displayManager.lightdm.enable = true;
   $extra_desktop
 
   systemd.services.kill-frecon = {
-    description = "Kill frecon to allow Xorg to start";
-    wantedBy = [ "graphical.target" ];
+    description = "Kill ChromeOS frecon-lite before display-manager";
+    wantedBy = [ "multi-user.target" ];
     before = [ "display-manager.service" ];
     serviceConfig = {
       Type = "oneshot";
-      ExecStart = [ "\${pkgs.bash}/bin/bash -c 'umount -l /dev/console 2>/dev/null || true; pkill frecon-lite 2>/dev/null || true'" ];
       RemainAfterExit = true;
+      ExecStart = pkgs.writeShellScript "kill-frecon" ''
+        \${pkgs.util-linux}/bin/umount -l /dev/console 2>/dev/null || true
+        \${pkgs.procps}/bin/pkill frecon-lite 2>/dev/null || true
+      '';
     };
   };
 
-  nixpkgs.config.allowUnfree = true;
-
-  users.mutableUsers = false;
-
+  # USERS
+  users.mutableUsers = true;
   users.users.root = lib.mkIf (lib.elem "$enable_root" [ "1" "true" "yes" ]) {
-    password = "$root_passwd";
+    initialPassword = "$root_passwd";
   };
-
   users.users.$username = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "video" "audio" "networkmanager" ];
+    description = "$username";
+    extraGroups = [ "wheel" "video" "audio" "networkmanager" "input" ];
     initialPassword = "$user_passwd";
   };
-
   security.sudo.wheelNeedsPassword = false;
 
-  environment.loginShellInit = ''
-    if [ -f /run/current-system/sw/bin/shimboot_greeter ]; then
-      /run/current-system/sw/bin/shimboot_greeter
-    fi
-  '';
-
+  # PACKAGES
+  nixpkgs.config.allowUnfree = true;
   environment.systemPackages = with pkgs; [
-    wget curl git nano vim
+    wget curl git vim nano
     pciutils usbutils
     networkmanagerapplet
-    cloud-utils
-    e2fsprogs
-    cryptsetup
-    util-linux
+    cloud-utils e2fsprogs cryptsetup util-linux
     (pkgs.writeShellScriptBin "expand_rootfs" (builtins.readFile ./expand_rootfs.sh))
   ];
 
+  # SERVICES
   services.openssh.enable = true;
   services.openssh.settings.PasswordAuthentication = true;
+  hardware.enableRedistributableFirmware = true;
 
   system.stateVersion = "24.05";
 }
@@ -133,16 +134,12 @@ HWCFG
 cat > "$rootfs_dir/etc/nixos/expand_rootfs.sh" << 'EXPAND'
 #!/bin/bash
 set -e
-if [ "$EUID" -ne 0 ]; then
-  echo "Run as root."
-  exit 1
-fi
+[ "$EUID" -ne 0 ] && { echo "Run as root."; exit 1; }
 root_dev="$(findmnt -T / -no SOURCE)"
 luks="$(echo "$root_dev" | grep "/dev/mapper" || true)"
 if [ "$luks" ]; then
   kname_dev="$(lsblk --list --noheadings --paths --output KNAME "$root_dev")"
-  kname="$(basename "$kname_dev")"
-  part_dev="/dev/$(basename "/sys/class/block/$kname/slaves/"*)"
+  part_dev="/dev/$(basename "/sys/class/block/$(basename "$kname_dev")/slaves/"*)"
 else
   part_dev="$root_dev"
 fi
@@ -150,14 +147,11 @@ disk_dev="$(lsblk --list --noheadings --paths --output PKNAME "$part_dev" | head
 part_num="$(echo "${part_dev#$disk_dev}" | tr -d 'p')"
 echo "Before:"; df -h /
 growpart "$disk_dev" "$part_num" || true
-if [ "$luks" ]; then
-  cryptsetup resize "$root_dev"
-fi
+[ "$luks" ] && cryptsetup resize "$root_dev"
 resize2fs "$root_dev" || true
 echo "After:"; df -h /
-echo "Done."
 EXPAND
 chmod +x "$rootfs_dir/etc/nixos/expand_rootfs.sh"
 
 echo "NixOS configuration written to $rootfs_dir/etc/nixos/"
-echo "build_rootfs.sh will now build the system closure via nix-build and copy it in."
+echo "build_rootfs.sh will now build the system closure via nix-build."

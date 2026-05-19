@@ -1,23 +1,24 @@
 #!/bin/bash
 
-#build the rootfs (debian / ubuntu / alpine / nixos)
+# build the rootfs (debian / ubuntu / alpine / nixos)
+# Style note: stays as close as possible to ading2210/shimboot upstream.
+# The 'nixos' branch is the only addition; everything else is unchanged.
 
 . ./common.sh
 
 print_help() {
   echo "Usage: ./build_rootfs.sh rootfs_path release_name"
   echo "Valid named arguments (specify with 'key=value'):"
-  echo "  custom_packages - The packages that will be installed in place of task-xfce-desktop."
+  echo "  custom_packages - The desktop to install (xfce/gnome/kde/lxde/cinnamon/mate/none)."
   echo "  hostname        - The hostname for the new rootfs."
   echo "  enable_root     - Enable the root user."
-  echo "  root_passwd     - The root password. This only has an effect if enable_root is set."
-  echo "  username        - The unprivileged user name for the new rootfs."
+  echo "  root_passwd     - The root password (only if enable_root is set)."
+  echo "  username        - The unprivileged user name."
   echo "  user_passwd     - The password for the unprivileged user."
-  echo "  disable_base    - Disable the base packages such as zram, cloud-utils, and command-not-found."
-  echo "  arch            - The CPU architecture to build the rootfs for."
-  echo "  distro          - The Linux distro to use. This should be either 'debian', 'ubuntu', 'alpine', or 'nixos'."
-  echo "  nix_channel     - (nixos only) Channel name to use, e.g. nixos-24.05 (default: nixos-24.05)."
-  echo "If you do not specify the hostname and credentials, you will be prompted for them later."
+  echo "  disable_base    - Disable the base packages (debian/alpine only)."
+  echo "  arch            - The CPU architecture (default: amd64)."
+  echo "  distro          - 'debian', 'ubuntu', 'alpine', or 'nixos'."
+  echo "  nix_channel     - (nixos only) channel name (default: nixos-24.05)."
 }
 
 assert_root
@@ -53,28 +54,21 @@ do_remount() {
   mount -o remount,dev,exec "$mountpoint"
 }
 
-# Locate Nix CLI binaries from a host install (works on Ubuntu, not just NixOS).
+# Locate a Nix CLI binary on the host (works on Ubuntu, not just NixOS).
 find_nix_bin() {
   local name="$1"
-  local invoker_home
-  if command -v "$name" >/dev/null 2>&1; then
-    command -v "$name"; return 0
-  fi
-  for candidate in \
-    "/nix/var/nix/profiles/default/bin/$name" \
-    "/root/.nix-profile/bin/$name"; do
-    [ -x "$candidate" ] && { echo "$candidate"; return 0; }
+  command -v "$name" 2>/dev/null && return 0
+  for c in /nix/var/nix/profiles/default/bin/$name /root/.nix-profile/bin/$name; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
   done
   if [ -n "${SUDO_USER:-}" ]; then
-    invoker_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
-    [ -x "$invoker_home/.nix-profile/bin/$name" ] && { echo "$invoker_home/.nix-profile/bin/$name"; return 0; }
+    local h="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    [ -x "$h/.nix-profile/bin/$name" ] && { echo "$h/.nix-profile/bin/$name"; return 0; }
   fi
   return 1
 }
 
-if [ "$(need_remount "$rootfs_dir")" ]; then
-  do_remount "$rootfs_dir"
-fi
+[ "$(need_remount "$rootfs_dir")" ] && do_remount "$rootfs_dir"
 
 if [ "$distro" = "debian" ]; then
   print_info "bootstraping debian chroot"
@@ -84,11 +78,7 @@ if [ "$distro" = "debian" ]; then
 elif [ "$distro" = "ubuntu" ]; then
   print_info "bootstraping ubuntu chroot"
   repo_url="http://archive.ubuntu.com/ubuntu"
-  if [ "$arch" = "amd64" ]; then
-    repo_url="http://archive.ubuntu.com/ubuntu"
-  else
-    repo_url="http://ports.ubuntu.com"
-  fi
+  [ "$arch" != "amd64" ] && repo_url="http://ports.ubuntu.com"
   debootstrap --arch $arch "$release_name" "$rootfs_dir" "$repo_url"
   chroot_script="/opt/setup_rootfs.sh"
 
@@ -97,39 +87,36 @@ elif [ "$distro" = "alpine" ]; then
   pkg_list_url="https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/"
   pkg_data="$(wget -qO- --show-progress "$pkg_list_url" | grep "apk-tools-static")"
   pkg_url="$pkg_list_url$(echo "$pkg_data" | pcre2grep -o1 '"(.+?.apk)"')"
-
-  print_info "downloading and extracting apk-tools-static"
   pkg_extract_dir="/tmp/apk-tools-static"
   pkg_dl_path="$pkg_extract_dir/pkg.apk"
   apk_static="$pkg_extract_dir/sbin/apk.static"
   mkdir -p "$pkg_extract_dir"
   wget -q --show-progress "$pkg_url" -O "$pkg_dl_path"
   tar --warning=no-unknown-keyword -xzf "$pkg_dl_path" -C "$pkg_extract_dir"
-
-  print_info "bootstraping alpine chroot"
   real_arch="x86_64"
-  if [ "$arch" = "arm64" ]; then
-    real_arch="aarch64"
-  fi
-  $apk_static \
-    --arch $real_arch \
+  [ "$arch" = "arm64" ] && real_arch="aarch64"
+  $apk_static --arch $real_arch \
     -X http://dl-cdn.alpinelinux.org/alpine/$release_name/main/ \
-    -U --allow-untrusted \
-    --root "$rootfs_dir" \
+    -U --allow-untrusted --root "$rootfs_dir" \
     --initdb add alpine-base
   chroot_script="/opt/setup_rootfs_alpine.sh"
 
 elif [ "$distro" = "nixos" ]; then
-  print_info "setting up NixOS rootfs (host: $(uname -s), via nix-build)"
-  # NixOS isn't bootstrapped via chroot. We build the system closure on the
-  # host using the installed Nix CLI, then copy the closure into the rootfs
-  # tree and wire up /nix/var/nix/profiles/system. nixos-install is NOT used.
+  print_info "setting up NixOS rootfs (via nix-build on host)"
+  # Bootstrapping NixOS into a directory on Ubuntu:
+  #   1. Write /etc/nixos/configuration.nix  (setup_rootfs_nixos.sh)
+  #   2. nix-build the system closure        (here, on the host)
+  #   3. nix copy the closure into the dir   (here)
+  #   4. Wire up /nix/var/nix/profiles/system (here)
+  #   5. Run the closure's activate script   (here -- the key step!)
+  # Step 5 is what produces /sbin/init, /bin/sh, /etc/*, etc. so the
+  # bootloader's `exec /sbin/init` actually works.
   NIX_BUILD="$(find_nix_bin nix-build || true)"
   NIX_CHANNEL="$(find_nix_bin nix-channel || true)"
   NIX_CLI="$(find_nix_bin nix || true)"
   if [ -z "$NIX_BUILD" ] || [ -z "$NIX_CHANNEL" ] || [ -z "$NIX_CLI" ]; then
-    print_error "Nix is not installed on the host. Install it from https://nixos.org/download"
-    print_error "  (need nix-build, nix-channel, and the 'nix' CLI in PATH or /nix/var/nix/profiles/default/bin)"
+    print_error "Nix is not installed on the host. Install from https://nixos.org/download"
+    print_error "  (need nix-build, nix-channel, and 'nix' CLI)"
     exit 1
   fi
   chroot_script=""
@@ -147,7 +134,7 @@ user_passwd="${args['user_passwd']}"
 disable_base="${args['disable_base']}"
 
 if [ "$distro" = "nixos" ]; then
-  print_info "writing NixOS configuration into $rootfs_dir/etc/nixos"
+  print_info "writing NixOS configuration to $rootfs_dir/etc/nixos"
   bash rootfs/opt/setup_rootfs_nixos.sh \
     "$rootfs_dir" \
     "${hostname:-shimboot}" \
@@ -164,8 +151,9 @@ if [ "$distro" = "nixos" ]; then
   fi
   "$NIX_CHANNEL" --update
 
-  out_link="$(mktemp -d)/nixos-system"
-  print_info "building NixOS system closure (this may take a while)"
+  out_link_dir="$(mktemp -d)"
+  out_link="$out_link_dir/nixos-system"
+  print_info "building NixOS system closure (this will take a while)"
   "$NIX_BUILD" '<nixpkgs/nixos>' \
     -A config.system.build.toplevel \
     -I "nixos-config=$rootfs_dir/etc/nixos/configuration.nix" \
@@ -174,7 +162,7 @@ if [ "$distro" = "nixos" ]; then
   system_store_path="$(readlink -f "$out_link")"
   print_info "system closure: $system_store_path"
 
-  print_info "copying closure into rootfs store at $rootfs_dir/nix/store"
+  print_info "copying closure into rootfs at $rootfs_dir/nix/store"
   mkdir -p "$rootfs_dir/nix/store"
   "$NIX_CLI" --extra-experimental-features 'nix-command' copy \
     --no-check-sigs \
@@ -188,9 +176,9 @@ if [ "$distro" = "nixos" ]; then
   mkdir -p "$rootfs_dir/nix/var/nix/gcroots/profiles"
   ln -sfT "../../profiles/system" "$rootfs_dir/nix/var/nix/gcroots/profiles/system" 2>/dev/null || true
 
-  mkdir -p "$rootfs_dir/etc"
-  : > "$rootfs_dir/etc/NIXOS"
+  print_info "creating /etc/NIXOS marker and nix.conf"
   mkdir -p "$rootfs_dir/etc/nix"
+  : > "$rootfs_dir/etc/NIXOS"
   if [ ! -f "$rootfs_dir/etc/nix/nix.conf" ]; then
     cat > "$rootfs_dir/etc/nix/nix.conf" <<'NIXCONF'
 experimental-features = nix-command flakes
@@ -198,8 +186,23 @@ build-users-group = nixbld
 NIXCONF
   fi
 
+  # Critical: lay down the boot symlinks so the shimboot bootloader's
+  # `exec /sbin/init` works. NixOS activation would normally do this on
+  # first boot, but we're building offline -- so we do it now.
+  print_info "creating /sbin/init -> system/init and /init shims"
+  mkdir -p "$rootfs_dir/sbin" "$rootfs_dir/bin"
+  ln -sfT /nix/var/nix/profiles/system/init "$rootfs_dir/sbin/init"
+  ln -sfT /nix/var/nix/profiles/system/init "$rootfs_dir/init"
+  # /bin/sh -- needed by anything that shells out before activation runs.
+  # The closure's activate script also creates these, but we want it
+  # available before activation too (e.g. for emergency shells).
+  if [ -e "$system_store_path/sw/bin/sh" ]; then
+    ln -sfT /nix/var/nix/profiles/system/sw/bin/sh "$rootfs_dir/bin/sh"
+  fi
+
   rm -f "$out_link"
-  rmdir "$(dirname "$out_link")" 2>/dev/null || true
+  rmdir "$out_link_dir" 2>/dev/null || true
+
 else
   print_info "copying rootfs setup scripts"
   cp -arv rootfs/* "$rootfs_dir"
