@@ -54,7 +54,10 @@ cat > "$rootfs_dir/etc/nixos/configuration.nix" << NIXCFG
   boot.loader.systemd-boot.enable = false;
   boot.loader.initScript.enable = true;
 
-  # No NixOS stage-1 initrd. The ChromeOS kernel + shimboot already booted us.
+  # NOTE: we leave boot.initrd.enable at its default (true) because some
+  # nixos-24.05 modules reference system.build.initialRamdisk unconditionally.
+  # The initrd is built but never used -- the ChromeOS kernel + shimboot
+  # bootloader handle stage 1. ~30MB of wasted disk; harmless.
   boot.initrd.availableKernelModules = lib.mkForce [];
   boot.initrd.kernelModules = lib.mkForce [];
   boot.kernelParams = lib.mkForce [];
