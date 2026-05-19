@@ -254,8 +254,14 @@ if [ ! "$rootfs_dir" ]; then
     release="${release:-edge}"
   elif [ "$distro" = "nixos" ]; then
     release="${release:-nixos}"
-    if ! command -v nix-env &> /dev/null && ! command -v nixos-install &> /dev/null; then
-      print_error "Nix is not installed. Install it from https://nixos.org/download"
+    # Check for a working Nix install on the host (Ubuntu/Debian both fine).
+    # We need nix-build; PATH may not include /nix/var/nix/profiles/default/bin
+    # when running under sudo, so check that location explicitly.
+    if ! command -v nix-build &> /dev/null \
+       && [ ! -x /nix/var/nix/profiles/default/bin/nix-build ] \
+       && [ ! -x /root/.nix-profile/bin/nix-build ]; then
+      print_error "Nix is not installed on the host. Install it from https://nixos.org/download"
+      print_error "  (build_rootfs.sh needs nix-build, nix-channel, and the 'nix' CLI)"
       exit 1
     fi
   else

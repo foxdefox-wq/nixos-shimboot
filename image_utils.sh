@@ -84,6 +84,15 @@ create_partitions() {
   local kernel_path=$(realpath -m "${2}")
   local is_luks="${3}"
   local crypt_password="${4}"
+  #optional ext4 label for the rootfs (so /dev/disk/by-label/<name> works);
+  #falls back to no label if not provided.
+  local rootfs_label="${5}"
+  local rootfs_label_arg=()
+  if [ -n "$rootfs_label" ]; then
+    #ext4 labels are capped at 16 bytes; truncate silently if needed.
+    rootfs_label="${rootfs_label:0:16}"
+    rootfs_label_arg=(-L "$rootfs_label")
+  fi
 
   #create stateful
   mkfs.ext4 "${image_loop}p1"
@@ -96,9 +105,9 @@ create_partitions() {
   if [ "$is_luks" ]; then
     echo "$crypt_password" | cryptsetup luksFormat "${image_loop}p4"
     echo "$crypt_password" | cryptsetup luksOpen "${image_loop}p4" rootfs
-    mkfs.ext4 /dev/mapper/rootfs
-  else 
-    mkfs.ext4 "${image_loop}p4"
+    mkfs.ext4 "${rootfs_label_arg[@]}" /dev/mapper/rootfs
+  else
+    mkfs.ext4 "${rootfs_label_arg[@]}" "${image_loop}p4"
   fi
 }
 
